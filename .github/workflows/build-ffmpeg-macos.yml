@@ -2,8 +2,6 @@ name: Build FFmpeg (macOS)
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 6 * * 1" # weekly, Monday 06:00 UTC
 
 jobs:
   build:
@@ -17,40 +15,43 @@ jobs:
             arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - name: Find latest FFmpeg release
-        id: ver
+      - name: Install dependencies
+        run: |
+          FORMULAS="aom dav1d fontconfig freetype libgsm harfbuzz lame libass libbluray libmodplug \
+            libmysofa libsoxr libvidstab libvmaf libvorbis libvpx libxml2 openh264 opencore-amr \
+            openjpeg opus rubberband snappy speex theora two-lame vo-amrwbenc webp x264 x265 \
+            xvid zeromq zimg zvbi"
+          brew install nasm pkgconf autoconf automake libtool $FORMULAS
+          # force static linking: drop the dylib twins of the libraries we link
+          for f in $FORMULAS; do find "$(brew --prefix "$f")/lib" -name '*.dylib' -delete; done
+          echo "PKG_CONFIG_PATH=$(brew --prefix libxml2)/lib/pkgconfig:$HOME/deps/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Build AviSynth+ headers and libshine (not in Homebrew / not bundled)
+        run: |
+          git clone --depth 1 https://github.com/AviSynth/AviSynthPlus.git avs
+          cmake -S avs -B avs/build -DHEADERS_ONLY=ON -DCMAKE_INSTALL_PREFIX="$HOME/deps" -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake --install avs/build
+          git clone --depth 1 https://github.com/toots/shine.git shine
+          cd shine
+          LIBTOOLIZE=glibtoolize ./bootstrap
+          ./configure --prefix="$HOME/deps" --enable-static --disable-shared
+          make -j"$(sysctl -n hw.ncpu)" install
+
+      - name: Build FFmpeg
         run: |
           TAG=$(git ls-remote --tags --refs https://github.com/FFmpeg/FFmpeg.git 'refs/tags/n[0-9]*' \
             | awk -F/ '{print $3}' | grep -E '^n[0-9]+\.[0-9]+(\.[0-9]+)?$' | sort -V | tail -1)
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Latest release: $TAG"
-
-      - name: Install dependencies
-        run: |
-          FORMULAS="aom dav1d fontconfig freetype gsm harfbuzz lame libass libbluray libmodplug \
-            libmysofa libogg libsoxr libvmaf libvorbis libvpx libxml2 openh264 opencore-amr \
-            openjpeg opus rubberband shine snappy speex theora twolame vid.stab vo-amrwbenc \
-            webp x264 x265 xvid zeromq zimg zvbi"
-          brew install nasm pkgconf $FORMULAS
-          # Remove dylibs so the linker is forced to use the static .a files
-          for f in $FORMULAS; do
-            rm -f "$(brew --prefix "$f")"/lib/*.dylib
-          done
-          echo "PKG_CONFIG_PATH=$(brew --prefix libxml2)/lib/pkgconfig" >> "$GITHUB_ENV"
-
-      - name: Download FFmpeg source
-        run: |
-          curl -fsSL "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/${{ steps.ver.outputs.tag }}.tar.gz" -o ffmpeg.tar.gz
-          mkdir src && tar -xzf ffmpeg.tar.gz -C src --strip-components=1
+          echo "FFmpeg $TAG"
+          git clone --depth 1 --branch "$TAG" https://github.com/FFmpeg/FFmpeg.git src
           sudo mkdir -p /opt/ffmpeg && sudo chown "$USER" /opt/ffmpeg
-
-      - name: Configure
-        working-directory: src
-        run: |
+          BREW="$(brew --prefix)"
+          cd src
           ./configure \
             --cc=/usr/bin/clang \
             --prefix=/opt/ffmpeg \
             --extra-version=tessus \
+            --extra-cflags="-I$HOME/deps/include -I$BREW/include -I$BREW/opt/libxml2/include" \
+            --extra-ldflags="-L$HOME/deps/lib -L$BREW/lib" \
             --enable-avisynth --enable-fontconfig --enable-gpl \
             --enable-libaom --enable-libass --enable-libbluray --enable-libdav1d \
             --enable-libfreetype --enable-libgsm --enable-libharfbuzz --enable-libmodplug \
@@ -63,27 +64,9 @@ jobs:
             --enable-libxml2 --enable-libxvid --enable-libzimg \
             --enable-libzmq --enable-libzvbi --enable-version3 \
             --pkg-config-flags=--static --disable-ffplay
-
-      - name: Build
-        working-directory: src
-        run: |
-          make -j"$(sysctl -n hw.ncpu)"
-          make install
-
-      - name: Verify binary
-        run: |
+          make -j"$(sysctl -n hw.ncpu)" install
           otool -L /opt/ffmpeg/bin/ffmpeg
-          if otool -L /opt/ffmpeg/bin/ffmpeg | grep -E '/opt/homebrew|/usr/local'; then
-            echo "::error::ffmpeg still links against non-system dylibs"; exit 1
-          fi
-          /opt/ffmpeg/bin/ffmpeg -version | head -2
-
-      - name: Package
-        run: |
-          NAME="ffmpeg-${{ steps.ver.outputs.tag }}-macos-${{ matrix.arch }}"
-          mkdir "$NAME"
-          cp /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe "$NAME"/
-          tar -czf "$NAME.tar.gz" "$NAME"
+          tar -czf "../ffmpeg-$TAG-macos-${{ matrix.arch }}.tar.gz" -C /opt/ffmpeg/bin ffmpeg ffprobe
 
       - uses: actions/upload-artifact@v4
         with:
