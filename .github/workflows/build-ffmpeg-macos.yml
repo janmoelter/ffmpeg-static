@@ -9,22 +9,44 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-26-intel
-            arch: x86_64
           - runner: macos-26
             arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Install dependencies
         run: |
-          FORMULAS="aom dav1d fontconfig freetype libgsm harfbuzz lame libass libbluray libmodplug \
-            libmysofa libsoxr libvidstab libvmaf libvorbis libvpx libxml2 openh264 opencore-amr \
+          # aom, dav1d and openh264 are built statically from source in the next step
+          FORMULAS="fontconfig freetype libgsm harfbuzz lame libass libbluray libmodplug \
+            libmysofa libsoxr libvidstab libvmaf libvorbis libvpx libxml2 opencore-amr \
             openjpeg opus rubberband snappy speex theora two-lame vo-amrwbenc webp x264 x265 \
             xvid zeromq zimg zvbi"
-          brew install nasm pkgconf autoconf automake libtool $FORMULAS
+          brew install nasm pkgconf autoconf automake libtool meson ninja $FORMULAS
           # force static linking: drop the dylib twins of the libraries we link
           for f in $FORMULAS; do find "$(brew --prefix "$f")/lib" -name '*.dylib' -delete; done
           echo "PKG_CONFIG_PATH=$(brew --prefix libxml2)/lib/pkgconfig:$HOME/deps/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      # Homebrew ships these three as shared libraries only
+      - name: Build dav1d, aom and openh264 statically
+        run: |
+          latest() { git ls-remote --tags --refs "$1" | awk -F/ '{print $3}' | grep -E "$2" | sort -V | tail -1; }
+          DEPS="$HOME/deps"; mkdir -p "$DEPS"; NCPU="$(sysctl -n hw.ncpu)"
+
+          T=$(latest https://code.videolan.org/videolan/dav1d.git '^[0-9]+\.[0-9]+\.[0-9]+$')
+          git clone -q --depth 1 --branch "$T" https://code.videolan.org/videolan/dav1d.git dav1d
+          meson setup dav1d/build dav1d --prefix="$DEPS" --libdir=lib --default-library=static --buildtype=release -Denable_tools=false -Denable_tests=false
+          meson install -C dav1d/build
+
+          T=$(latest https://aomedia.googlesource.com/aom '^v[0-9]+\.[0-9]+\.[0-9]+$')
+          git clone -q --depth 1 --branch "$T" https://aomedia.googlesource.com/aom aom
+          cmake -S aom -B aom/build -DCMAKE_INSTALL_PREFIX="$DEPS" -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_SHARED_LIBS=OFF \
+            -DENABLE_DOCS=OFF -DENABLE_TESTS=OFF -DENABLE_TOOLS=OFF -DENABLE_EXAMPLES=OFF -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake --build aom/build -j"$NCPU"
+          cmake --install aom/build
+
+          T=$(latest https://github.com/cisco/openh264.git '^v[0-9]+\.[0-9]+\.[0-9]+$')
+          git clone -q --depth 1 --branch "$T" https://github.com/cisco/openh264.git openh264
+          make -C openh264 -j"$NCPU" install-static PREFIX="$DEPS"
+          ls "$DEPS/lib"/libdav1d.a "$DEPS/lib"/libaom.a "$DEPS/lib"/libopenh264.a
 
       - name: Build AviSynth+ headers and libshine (not in Homebrew / not bundled)
         run: |
@@ -32,7 +54,7 @@ jobs:
             | awk -F/ '{print $3}' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
           git clone --depth 1 --branch "$AVS" https://github.com/AviSynth/AviSynthPlus.git avs
           cmake -S avs -B avs/build -DHEADERS_ONLY=ON -DCMAKE_INSTALL_PREFIX="$HOME/deps" -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-          cmake --build avs/build
+          cmake --build avs/build   # generates version.h
           cmake --install avs/build
           git clone --depth 1 https://github.com/toots/shine.git shine
           cd shine
